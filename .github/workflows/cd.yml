@@ -1,0 +1,87 @@
+name: Vendas CD
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        env:
+          ECR_REPOSITORY: ${{ vars.SALES_ECR_REPOSITORY }}
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          docker build -t $ECR_REPOSITORY:${GITHUB_SHA} .
+          docker tag $ECR_REPOSITORY:${GITHUB_SHA} $ECR_REGISTRY/$ECR_REPOSITORY:${GITHUB_SHA}
+          docker tag $ECR_REPOSITORY:${GITHUB_SHA} $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:${GITHUB_SHA}
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      - name: Deploy new task definition revision
+        env:
+          ECR_REPOSITORY: ${{ vars.SALES_ECR_REPOSITORY }}
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECS_CLUSTER: ${{ vars.SALES_ECS_CLUSTER }}
+          ECS_SERVICE: ${{ vars.SALES_ECS_SERVICE }}
+          CONTAINER_NAME: ${{ vars.SALES_CONTAINER_NAME }}
+        run: |
+          set -euo pipefail
+
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:${GITHUB_SHA}"
+          CURRENT_TASK_DEF_ARN=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --query "services[0].taskDefinition" \
+            --output text)
+
+          aws ecs describe-task-definition \
+            --task-definition "$CURRENT_TASK_DEF_ARN" \
+            --query "taskDefinition" > task-def.json
+
+          cat task-def.json | jq --arg IMAGE "$IMAGE_URI" --arg NAME "$CONTAINER_NAME" '
+            .containerDefinitions |= map(
+              if .name == $NAME then .image = $IMAGE else . end
+            ) |
+            del(
+              .taskDefinitionArn,
+              .revision,
+              .status,
+              .requiresAttributes,
+              .compatibilities,
+              .registeredAt,
+              .registeredBy
+            )
+          ' > task-def-updated.json
+
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://task-def-updated.json \
+            --query "taskDefinition.taskDefinitionArn" \
+            --output text)
+
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "$NEW_TASK_DEF_ARN"
+
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE"
