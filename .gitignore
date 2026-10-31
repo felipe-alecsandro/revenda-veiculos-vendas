@@ -8,3 +8,5 @@ coverage
 iac/terraform/.terraform/
 iac/terraform/*.tfstate
 iac/terraform/*.tfstate.*
+iac/terraform/*.tfvars
+iac/terraform/*.auto.tfvars
